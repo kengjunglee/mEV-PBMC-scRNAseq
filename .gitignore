@@ -1,0 +1,34 @@
+# --- Data & references (large / restricted; not tracked) ---
+data/
+ref/
+*.rds
+*.h5
+*.h5ad
+*.loom
+*.mtx
+*.mtx.gz
+barcodes.tsv*
+features.tsv*
+genes.tsv*
+
+# Keep results dir but ignore bulky outputs if desired
+# results/*.csv
+
+# --- R ---
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+*_cache/
+*_files/
+*.nb.html
+*.html
+*.utf8.md
+*.knit.md
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*~
+.vscode/

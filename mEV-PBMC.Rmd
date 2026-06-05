@@ -1,0 +1,327 @@
+---
+title: "scRNA-seq of human PBMCs treated with mechanically generated extracellular vesicles (mEV)"
+author: "Keng Jung Lee (Zheng Lab)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+Single-cell RNA-seq analysis of human peripheral blood mononuclear cells (PBMCs)
+treated *ex vivo* with **mechanically generated EVs (mEV)** shed by circulating
+tumor cells arrested in the microvasculature, **canonical secreted EVs (sEV)**,
+or **PBS** (vehicle control). Four donors (606, 610, 706, 746) were each split
+across the three conditions and processed with cell hashing (HTO) on the 10x
+Genomics platform.
+
+mEVs are enriched in the nuclear DAMP HMGB1 and potently activate monocytes;
+this experiment profiles the single-cell PBMC response to mEV vs sEV, focusing
+on the monocyte and dendritic-cell compartments.
+
+| Sample | Donor | Condition | HTO multiplexed |
+|--------|-------|-----------|-----------------|
+| 606M / 610M / 706M / 746M | 606/610/706/746 | mEV | yes |
+| 606P / 610P / 706P / 746P | 606/610/706/746 | PBS | yes |
+| 606S / 610S / 706S / 746S | 606/610/706/746 | sEV | yes |
+
+**Pipeline:** QC → HTO demultiplexing → filtering → SCTransform → CCA
+integration → clustering → marker-based annotation → pseudobulk DESeq2 DE
+(mEV vs sEV) → GO enrichment → Azimuth reference mapping.
+
+> **Paths:** raw `cellranger` outputs are expected under `data/post_aggr/<sample>/`.
+> Edit the `data_dir` variable below to point at your local copy.
+
+# Setup
+
+```{r libraries}
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggridges)
+library(patchwork)
+library(monocle3)
+```
+
+```{r config}
+# Root directory holding cellranger filtered matrices, one folder per sample.
+data_dir <- "data/post_aggr"
+
+samples <- c("606M","606P","606S",
+             "610M","610P","610S",
+             "706M","706P","706S",
+             "746M","746P","746S")
+
+# Map sample suffix -> treatment condition.
+suffix_to_condition <- c(M = "mEV", P = "PBS", S = "sEV")
+```
+
+# 1. Load 10x data
+
+Each sample contains both a Gene Expression and an Antibody Capture (HTO) assay.
+
+```{r load-10x}
+raw <- lapply(samples, function(s) {
+  Read10X(data.dir = file.path(data_dir, s, "outs/count/filtered_feature_bc_matrix"))
+})
+names(raw) <- samples
+```
+
+# 2. Create Seurat objects (RNA + HTO) and add metadata
+
+```{r create-objects}
+objects <- lapply(samples, function(s) {
+  obj <- CreateSeuratObject(counts = raw[[s]][["Gene Expression"]])
+  obj[["hto"]] <- CreateAssayObject(counts = raw[[s]][["Antibody Capture"]])
+
+  condition <- suffix_to_condition[substr(s, 4, 4)]   # last char: M/P/S
+  obj <- AddMetaData(obj, metadata = condition, col.name = "Condition")
+  obj <- AddMetaData(obj, metadata = s,          col.name = "Sample")
+  obj
+})
+names(objects) <- samples
+```
+
+# 3. QC metrics
+
+```{r qc-metrics}
+objects <- lapply(objects, function(obj) {
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj
+})
+
+# Per-sample QC visualisation
+for (s in samples) {
+  print(
+    VlnPlot(objects[[s]],
+            features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+            ncol = 3) + patchwork::plot_annotation(title = s)
+  )
+  print(
+    FeatureScatter(objects[[s]], feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+      geom_smooth() + ggtitle(s)
+  )
+}
+```
+
+# 4. Merge
+
+```{r merge}
+merged <- merge(
+  objects[[1]], y = objects[-1],
+  add.cell.ids = samples,
+  project = "merged_pbmc"
+)
+merged
+```
+
+# 5. HTO demultiplexing
+
+```{r hto-demux}
+# Log-normalize RNA; CLR-normalize HTO.
+merged <- NormalizeData(merged, assay = "RNA")
+merged <- FindVariableFeatures(merged, selection.method = "mean.var.plot", assay = "RNA")
+merged <- ScaleData(merged, features = VariableFeatures(merged), assay = "RNA")
+
+merged <- NormalizeData(merged, assay = "hto", normalization.method = "CLR")
+merged <- HTODemux(merged, assay = "hto", positive.quantile = 0.99)
+
+table(merged$hto_classification.global)
+```
+
+```{r hto-plots, fig.width=6, fig.height=5}
+Idents(merged) <- "hto_maxID"
+RidgePlot(merged, assay = "hto", features = rownames(merged[["hto"]])[1:2], ncol = 2)
+FeatureScatter(merged, feature1 = "Hu.Hashtag-1", feature2 = "Hu.Hashtag-2")
+```
+
+```{r hto-tsne}
+# Drop HTO-negative droplets and visualise singlet/doublet structure on an
+# HTO-distance tSNE.
+Idents(merged) <- "hto_classification.global"
+merged.subset <- subset(merged, idents = "Negative", invert = TRUE)
+
+hto.dist.mtx <- as.matrix(dist(t(GetAssayData(merged.subset, assay = "hto"))))
+merged.subset <- RunTSNE(merged.subset, distance.matrix = hto.dist.mtx, perplexity = 100)
+DimPlot(merged.subset)
+```
+
+# 6. QC filtering
+
+```{r filter}
+# Retain cells with 200 < nFeature_RNA < 8000 and < 5% mitochondrial reads.
+merged <- subset(merged, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 5)
+```
+
+# 7. Normalization, PCA, UMAP
+
+```{r sctransform}
+merged <- SCTransform(merged)
+merged <- RunPCA(merged)
+merged <- RunUMAP(merged, dims = 1:30)
+
+DimPlot(merged, reduction = "umap", group.by = c("Condition", "orig.ident"))
+```
+
+# 8. Integration (CCA) and clustering
+
+```{r integrate}
+merged_integ <- IntegrateLayers(
+  object = merged, method = CCAIntegration,
+  normalization.method = "SCT", verbose = FALSE
+)
+merged_integ <- FindNeighbors(merged_integ, reduction = "integrated.dr", dims = 1:10)
+merged_integ <- FindClusters(merged_integ, resolution = 0.8)
+merged_integ <- RunUMAP(merged_integ, dims = 1:10, reduction = "integrated.dr")
+
+DimPlot(merged_integ, reduction = "umap", label = TRUE, label.size = 3, alpha = 0.5)
+DimPlot(merged_integ, reduction = "umap", split.by = "Condition",
+        label = TRUE, label.size = 3, alpha = 0.5)
+DimPlot(merged_integ, reduction = "umap", split.by = "Sample",
+        label = TRUE, label.size = 3, alpha = 0.5)
+```
+
+# 9. Canonical marker expression
+
+```{r marker-panel}
+# Lineage markers used to guide cluster annotation.
+markers <- c("PTPRC","MS4A1","GNLY","CD3D","CD3E","CD3G","CD14","CD68",
+             "FCER1A","FCGR3A","LYZ","PPBP","CD8A","GZMB","CD4","CD79A",
+             "CD79B","HBG1","HBG2","KLRF1","XCL1")
+FeaturePlot(merged_integ, features = markers, pt.size = 0.5)
+```
+
+```{r marker-by-condition}
+# Markers of interest, split by treatment condition.
+markers_by_condition <- c("CD3E","CD3G","CD8A","CD8B","MS4A1","CD79A","CD79B",
+                          "CD19","CD14","LYZ","FCER1A","CD4","IL7R","CCR7",
+                          "SELL","S100A4","FCGR3A","NKG7","GNLY","SLC4A10",
+                          "CST3","IL3RA","CD27","MKI67","GSDMD","CD271")
+for (g in markers_by_condition) {
+  print(FeaturePlot(merged_integ, features = g, pt.size = 0.5, split.by = "Condition"))
+}
+```
+
+# 10. Cluster markers
+
+```{r find-markers}
+merged_integ_prep <- PrepSCTFindMarkers(merged_integ, assay = "SCT", verbose = TRUE)
+merged_integ.markers <- FindAllMarkers(merged_integ_prep)
+
+merged_integ.markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  slice_head(n = 10) %>%
+  ungroup() -> top10
+
+DoHeatmap(merged_integ, features = top10$gene) + NoLegend()
+```
+
+# 11. Cell-type annotation
+
+```{r annotate}
+# Cluster -> cell-type assignment based on canonical markers above.
+labeled.merged_integ <- RenameIdents(
+  merged_integ,
+  `0` = "Memory CD4 T", `1` = "Naive CD4 T", `2` = "Naive CD4 T",
+  `3` = "Monocytes",    `4` = "NK",          `5` = "NK",
+  `6` = "Monocytes",    `7` = "CD8 T",       `8` = "CD8 T",
+  `9` = "CD8 T",        `10` = "Naive CD4 T",`11` = "MAIT T",
+  `12` = "B",           `13` = "Naive CD4 T",`14` = "DC",
+  `15` = "NK T",        `16` = "B",          `17` = "Memory CD4 T",
+  `18` = "Naive CD4 T", `19` = "Naive CD4 T"
+)
+DimPlot(labeled.merged_integ, label = TRUE)
+DimPlot(labeled.merged_integ, label = TRUE, split.by = "Condition")
+```
+
+# 12. Pseudobulk differential expression (mEV vs sEV)
+
+Aggregate to individual × cell-type pseudobulk profiles, then run DESeq2 within
+a cell type comparing mEV vs sEV.
+
+```{r pseudobulk}
+bulk <- AggregateExpression(
+  labeled.merged_integ, return.seurat = TRUE, slot = "counts",
+  assays = "RNA", group.by = c("ident", "Sample", "Condition")
+)
+```
+
+```{r de-monocytes}
+mono.bulk <- subset(bulk, orig.ident == "Monocytes")
+Idents(mono.bulk) <- "Condition"
+de_markers <- FindMarkers(mono.bulk, ident.1 = "mEV", ident.2 = "sEV",
+                          slot = "counts", test.use = "DESeq2", verbose = FALSE)
+de_markers$gene <- rownames(de_markers)
+
+library(ggrepel)
+ggplot(de_markers, aes(avg_log2FC, -log10(p_val))) +
+  geom_point(size = 0.5, alpha = 0.5) + theme_bw() +
+  ylab("-log10(unadjusted p-value)") +
+  geom_text_repel(aes(label = ifelse(p_val_adj < 0.05, gene, "")),
+                  colour = "red", size = 3)
+
+write.csv(de_markers, file = "results/mono_deg_mEVvssEV.csv")
+```
+
+```{r de-dc}
+DC.bulk <- subset(bulk, orig.ident == "DC")
+Idents(DC.bulk) <- "Condition"
+de_markers_DC <- FindMarkers(DC.bulk, ident.1 = "mEV", ident.2 = "sEV",
+                             slot = "counts", test.use = "DESeq2", verbose = FALSE)
+de_markers_DC$gene <- rownames(de_markers_DC)
+
+ggplot(de_markers_DC, aes(avg_log2FC, -log10(p_val))) +
+  geom_point(size = 0.5, alpha = 0.5) + theme_bw() +
+  ylab("-log10(unadjusted p-value)") +
+  geom_text_repel(aes(label = ifelse(p_val_adj < 0.05, gene, "")),
+                  colour = "red", size = 3)
+```
+
+# 13. GO enrichment of mEV-upregulated genes (monocytes)
+
+```{r go}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+up_gene_mEVvssEV <- rownames(de_markers[de_markers$avg_log2FC > 0, ])
+
+GO_results <- enrichGO(
+  gene    = up_gene_mEVvssEV,
+  OrgDb   = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont     = "BP"
+)
+as.data.frame(GO_results)
+barplot(GO_results, showCategory = 20)
+```
+
+# 14. Azimuth reference mapping
+
+```{r azimuth}
+library(Azimuth)
+library(SeuratData)
+
+options(timeout = 1000)
+merged.mapped <- RunAzimuth(merged, reference = "pbmcref")
+
+p1 <- DimPlot(merged.mapped, group.by = "predicted.celltype.l2",
+              label = TRUE, label.size = 3) + NoLegend()
+p2 <- DimPlot(merged.mapped, group.by = "Condition")
+p1 + p2
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
