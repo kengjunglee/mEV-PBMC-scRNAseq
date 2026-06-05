@@ -1,0 +1,418 @@
+---
+title: "scRNA-seq of human PBMCs treated with mEV — Azimuth reference mapping and CD14 monocyte analysis"
+author: "Keng Jung Lee (Zheng Lab)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+Companion notebook to `mEV-PBMC.Rmd`. Instead of HTO demultiplexing + CCA
+integration + manual annotation, this notebook annotates the same 12 PBMC
+libraries by **Azimuth reference mapping** to the `pbmcref` PBMC atlas, then
+focuses downstream analysis on the **CD14 monocyte** compartment — the cell type
+most strongly activated by mechanically generated EVs (mEV) via the HMGB1 axis.
+
+Single-cell RNA-seq of human PBMCs treated *ex vivo* with **mechanically
+generated EVs (mEV)**, **canonical secreted EVs (sEV)**, or **PBS** (vehicle).
+Four donors (606, 610, 706, 746) were each split across the three conditions on
+the 10x Genomics platform.
+
+**Pipeline:** load → QC → merge → filter → normalize → Azimuth mapping
+(`pbmcref`, `predicted.celltype.l2`) → CD14-monocyte pairwise DE across the three
+conditions → GO/GSEA enrichment → optional CD14 subclustering and trajectory
+analysis.
+
+> **Paths:** raw `cellranger` outputs are expected under
+> `data/post_aggr/<sample>/`. Edit the `data_dir` variable below to point at your
+> local copy. Tables and figures are written to `results/`.
+
+# Setup
+
+```{r libraries}
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggridges)
+library(ggrepel)
+library(patchwork)
+library(data.table)
+```
+
+```{r config}
+# Root directory holding cellranger filtered matrices, one folder per sample.
+data_dir    <- "data/post_aggr"
+results_dir <- "results"
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+samples <- c("606M","606P","606S",
+             "610M","610P","610S",
+             "706M","706P","706S",
+             "746M","746P","746S")
+
+# Map sample suffix (last character) -> treatment condition.
+suffix_to_condition <- c(M = "mEV", P = "PBS", S = "sEV")
+```
+
+# 1. Load 10x data
+
+```{r load-10x}
+raw <- lapply(samples, function(s) {
+  Read10X(data.dir = file.path(data_dir, s, "outs/count/filtered_feature_bc_matrix"))
+})
+names(raw) <- samples
+```
+
+# 2. Create Seurat objects and add metadata
+
+```{r create-objects}
+objects <- lapply(samples, function(s) {
+  counts <- raw[[s]]
+  # Multi-assay runs return a list; take the Gene Expression matrix.
+  if (is.list(counts)) counts <- counts[["Gene Expression"]]
+
+  obj <- CreateSeuratObject(counts = counts)
+  condition <- suffix_to_condition[substr(s, 4, 4)]
+  obj <- AddMetaData(obj, metadata = condition, col.name = "Condition")
+  obj <- AddMetaData(obj, metadata = s,          col.name = "Sample")
+  obj
+})
+names(objects) <- samples
+```
+
+# 3. QC metrics
+
+```{r qc-metrics}
+objects <- lapply(objects, function(obj) {
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj
+})
+
+# Per-sample QC visualisation.
+for (s in samples) {
+  print(
+    VlnPlot(objects[[s]],
+            features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+            ncol = 3) + patchwork::plot_annotation(title = s)
+  )
+  print(
+    FeatureScatter(objects[[s]], feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+      geom_smooth() + ggtitle(s)
+  )
+}
+```
+
+# 4. Merge
+
+```{r merge}
+merged <- merge(
+  objects[[1]], y = objects[-1],
+  add.cell.ids = samples,
+  project = "merged_pbmc"
+)
+merged
+```
+
+# 5. QC filtering
+
+```{r filter}
+# Retain cells with 200 < nFeature_RNA < 8000 and < 5% mitochondrial reads.
+# (Filtering is applied to the merged object so that downstream steps operate on
+# the filtered cells — in the original exploratory notebook the per-sample
+# subset() calls ran *after* the merge and were therefore never propagated.)
+merged <- subset(merged, subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 5)
+merged
+```
+
+# 6. Normalization
+
+```{r normalize}
+merged <- NormalizeData(merged, assay = "RNA")
+merged <- FindVariableFeatures(merged, selection.method = "mean.var.plot", assay = "RNA")
+merged <- ScaleData(merged, features = VariableFeatures(merged), assay = "RNA")
+```
+
+# 7. Azimuth reference mapping
+
+`RunAzimuth` is slow and downloads the `pbmcref` reference at runtime. Run the
+compute chunk once, save the result, and reload from cache on subsequent knits.
+
+```{r azimuth-run, eval=FALSE}
+library(Azimuth)
+library(SeuratData)
+
+options(timeout = 1000)
+merged.mapped <- RunAzimuth(merged, reference = "pbmcref")
+saveRDS(merged.mapped, file.path(results_dir, "merged.mapped.rds"))
+```
+
+```{r azimuth-load}
+# Reload the cached mapping produced by the chunk above.
+merged.mapped <- readRDS(file.path(results_dir, "merged.mapped.rds"))
+```
+
+```{r azimuth-dimplots, fig.width=20, fig.height=10}
+# UMAP coloured by predicted cell type (l2), split by treatment condition.
+DimPlot(merged.mapped, group.by = "predicted.celltype.l2",
+        split.by = "Condition", label = TRUE, label.size = 3,
+        repel = TRUE, alpha = 0.3)
+```
+
+```{r azimuth-dimplot-all, fig.width=12, fig.height=10}
+DimPlot(merged.mapped, group.by = "predicted.celltype.l2",
+        label = TRUE, label.size = 5, repel = TRUE, alpha = 0.2)
+```
+
+```{r azimuth-score, fig.width=12, fig.height=8}
+# Mapping-confidence score per predicted cell type.
+VlnPlot(merged.mapped, features = "predicted.celltype.l2.score")
+```
+
+# 8. Cell-type composition
+
+```{r composition}
+md <- as.data.table(merged.mapped@meta.data)
+celltype_counts <- md[, .N, by = c("Condition", "predicted.celltype.l2")]
+celltype_counts <- celltype_counts[order(Condition, -N)]
+celltype_counts
+
+write.csv(celltype_counts, file.path(results_dir, "celltype_counts_by_condition.csv"),
+          row.names = FALSE)
+```
+
+# 9. Marker expression in monocytes
+
+Inflammatory, pyroptosis, and tissue-factor / thrombosis markers central to the
+mEV–HMGB1–monocyte axis.
+
+```{r prep-de}
+# SCTransform for marker visualisation and within-cell-type DE.
+merged.mapped <- SCTransform(merged.mapped)
+Idents(merged.mapped) <- "predicted.celltype.l2"
+```
+
+```{r marker-vln}
+VlnPlot(merged.mapped, features = c("GSDMD"),
+        split.by = "Condition", group.by = "predicted.celltype.l2",
+        idents = "CD14 Mono")
+
+VlnPlot(merged.mapped, features = c("TNF", "IL1B", "IL6"),
+        split.by = "Condition", group.by = "predicted.celltype.l2",
+        idents = "CD16 Mono")
+```
+
+```{r marker-feature, fig.width=12, fig.height=5}
+# Tissue factor (F3) and CD14, by condition.
+FeaturePlot(merged.mapped, features = c("F3", "CD14"), split.by = "Condition")
+```
+
+# 10. CD14 monocyte differential expression (pairwise across conditions)
+
+Within CD14 monocytes, compare each pair of conditions on the corrected SCT
+counts. `PrepSCTFindMarkers` recomputes the corrected counts after subsetting.
+
+```{r de-prep}
+merged.mapped.prepfind <- PrepSCTFindMarkers(merged.mapped)
+merged.mapped.prepfind$celltype.condition <-
+  paste(merged.mapped.prepfind$predicted.celltype.l2,
+        merged.mapped.prepfind$Condition, sep = "_")
+Idents(merged.mapped.prepfind) <- "celltype.condition"
+```
+
+```{r de-run}
+# Helper: FindMarkers between two CD14-monocyte condition groups.
+cd14_de <- function(cond1, cond2) {
+  res <- FindMarkers(merged.mapped.prepfind,
+                     ident.1 = paste0("CD14 Mono_", cond1),
+                     ident.2 = paste0("CD14 Mono_", cond2),
+                     verbose = FALSE)
+  res$gene <- rownames(res)
+  res
+}
+
+de_markers_mvss <- cd14_de("mEV", "sEV")   # mEV vs sEV
+de_markers_mvsp <- cd14_de("mEV", "PBS")   # mEV vs PBS
+de_markers_svsp <- cd14_de("sEV", "PBS")   # sEV vs PBS
+
+write.csv(de_markers_mvss, file.path(results_dir, "de_markers_mvss_cd14.csv"))
+write.csv(de_markers_mvsp, file.path(results_dir, "de_markers_mvsp_cd14.csv"))
+write.csv(de_markers_svsp, file.path(results_dir, "de_markers_svsp_cd14.csv"))
+```
+
+```{r volcano}
+# Helper: volcano plot labelling genes past adjusted-p and fold-change cutoffs.
+volcano <- function(de, title, padj = 0.05, lfc = 1) {
+  ggplot(de, aes(avg_log2FC, -log10(p_val))) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    theme_bw() +
+    ylab("-log10(unadjusted p-value)") +
+    ggtitle(title) +
+    geom_text_repel(
+      aes(label = ifelse(p_val_adj < padj & avg_log2FC > lfc, gene, "")),
+      colour = "red", size = 3)
+}
+
+volcano(de_markers_mvss, "CD14 Mono: mEV vs sEV")
+volcano(de_markers_mvsp, "CD14 Mono: mEV vs PBS")
+volcano(de_markers_svsp, "CD14 Mono: sEV vs PBS")
+```
+
+```{r cellscatter, fig.width=10, fig.height=5}
+library(cowplot)
+theme_set(theme_cowplot())
+genes.to.label <- c("IL1B", "S100A9", "IFI6", "ISG20", "MX1",
+                    "IFIT2", "IFIT1", "CXCL10", "CCL8")
+p1 <- CellScatter(merged.mapped.prepfind, "CD14 Mono_PBS", "CD14 Mono_mEV",
+                  highlight = genes.to.label)
+LabelPoints(plot = p1, points = genes.to.label, repel = TRUE)
+```
+
+# 11. GO enrichment (GSEA) of CD14 DE contrasts
+
+```{r gsea-libs}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+require(DOSE)
+```
+
+```{r gsea-run}
+# Helper: ranked gene list (by avg_log2FC) -> gseGO over Biological Process.
+run_gse <- function(de) {
+  de <- de[order(de$avg_log2FC, decreasing = TRUE), ]
+  gl <- de$avg_log2FC
+  names(gl) <- rownames(de)
+  gseGO(gl, ont = "BP", keyType = "SYMBOL",
+        OrgDb = "org.Hs.eg.db", eps = 1e-300)
+}
+
+gse.mvss.cd14 <- run_gse(de_markers_mvss)
+gse.mvsp.cd14 <- run_gse(de_markers_mvsp)
+gse.svsp.cd14 <- run_gse(de_markers_svsp)
+
+write.csv(as.data.frame(gse.mvss.cd14), file.path(results_dir, "gse.mvss.cd14.csv"))
+write.csv(as.data.frame(gse.mvsp.cd14), file.path(results_dir, "gse.mvsp.cd14.csv"))
+write.csv(as.data.frame(gse.svsp.cd14), file.path(results_dir, "gse.svsp.cd14.csv"))
+```
+
+```{r gsea-dotplots, fig.width=12, fig.height=18}
+dotplot(gse.mvss.cd14, showCategory = 10, split = ".sign") + facet_grid(. ~ .sign)
+dotplot(gse.mvsp.cd14, showCategory = 10, split = ".sign") + facet_grid(. ~ .sign)
+dotplot(gse.svsp.cd14, showCategory = 10, split = ".sign") + facet_grid(. ~ .sign)
+```
+
+```{r gsea-curves}
+# Representative enrichment curves (edit geneSetID to a term in your results).
+# NF-kB signalling (mEV vs PBS):
+gseaplot(gse.mvsp.cd14, geneSetID = "GO:0007249")
+# Pattern-recognition / NLRP3-related terms (mEV vs sEV):
+gseaplot(gse.mvss.cd14, geneSetID = "GO:0062208")
+```
+
+# 12. CD14 monocyte subclustering (optional)
+
+Re-embed CD14 monocytes alone to resolve activation substructure.
+
+```{r cd14-subset}
+cd14 <- subset(merged.mapped, idents = "CD14 Mono")
+cd14 <- NormalizeData(cd14)
+cd14 <- FindVariableFeatures(cd14, nfeatures = 3000, assay = "RNA")
+cd14 <- ScaleData(cd14)
+cd14 <- RunPCA(cd14)
+cd14 <- FindNeighbors(cd14)
+cd14 <- FindClusters(cd14, resolution = 0.4)
+cd14 <- RunUMAP(cd14, n.neighbors = 10, dims = 1:50, spread = 2, min.dist = 0.3)
+```
+
+```{r cd14-dimplots, fig.width=10, fig.height=5}
+# Okabe-Ito colour-blind-safe palette.
+okabe_ito <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
+               "#0072B2", "#D55E00", "#CC79A7", "#999999")
+
+DimPlot(cd14, group.by = "seurat_clusters", repel = TRUE,
+        alpha = 0.7, cols = okabe_ito)
+DimPlot(cd14, group.by = "seurat_clusters", split.by = "Condition",
+        label = TRUE, repel = TRUE, alpha = 0.7, cols = okabe_ito)
+DimPlot(cd14, group.by = "Condition", alpha = 0.7)
+```
+
+```{r cd14-features, fig.width=12, fig.height=5}
+FeaturePlot(cd14, features = c("TNF", "IL1B", "HMGB1"), split.by = "Condition")
+FeaturePlot(cd14, features = "PLAUR", split.by = "Condition")
+FeaturePlot(cd14, features = "CXCL10", split.by = "Condition")
+
+VlnPlot(cd14, features = c("PGK1", "SERPINE1", "S100A9", "RUNX1",
+                           "PLAUR", "PLGRKT", "HPN"))
+```
+
+# 13. Combined monocyte (CD14 + CD16) embedding (optional)
+
+```{r mono-subset}
+mono <- subset(merged.mapped, idents = c("CD14 Mono", "CD16 Mono"))
+mono <- NormalizeData(mono)
+mono <- RunPCA(mono)
+mono <- FindNeighbors(mono)
+mono <- FindClusters(mono, resolution = 1)
+mono <- RunUMAP(mono, n.neighbors = 10, dims = 1:50, spread = 2, min.dist = 0.3)
+
+DimPlot(mono, reduction = "umap", split.by = "Condition",
+        group.by = "predicted.celltype.l2")
+DimPlot(mono, reduction = "umap")
+```
+
+# 14. Trajectory analysis (exploratory)
+
+Slingshot lineage inference over the CD14 monocyte subclusters. This is
+exploratory: the starting cluster should be chosen from the biology (e.g. the
+least-activated resting cluster), so the chunk is not evaluated by default.
+
+```{r slingshot, eval=FALSE}
+library(slingshot)
+library(SingleCellExperiment)
+
+set.seed(1)
+dimred     <- Embeddings(cd14, "umap")
+clustering <- cd14$seurat_clusters
+
+# Fit lineages and principal curves (set start.clus to your resting cluster).
+sds <- slingshot(dimred, clusterLabels = clustering, stretch = 0)
+
+# Colour cells by cluster and overlay the inferred lineage(s).
+pal <- setNames(okabe_ito[seq_along(levels(clustering))], levels(clustering))
+plot(dimred, col = pal[clustering], pch = 16, cex = 0.5, asp = 1,
+     xlab = "UMAP1", ylab = "UMAP2", main = "Slingshot trajectory")
+lines(SlingshotDataSet(sds), lwd = 2, col = "black")
+```
+
+# Appendix: mouse macrophage marker enrichment (external data, optional)
+
+Side analysis on an external mouse macrophage marker table
+(`data/macmarkers.csv`); unrelated to the human PBMC pipeline above. Provided
+for reference only.
+
+```{r mac-gsea, eval=FALSE}
+library(org.Mm.eg.db)
+
+mac <- read.csv(file.path(data_dir, "..", "macmarkers.csv"), header = TRUE)
+mac <- mac[order(mac$avg_log2FC, decreasing = TRUE), ]
+gl_mac <- mac$avg_log2FC
+names(gl_mac) <- mac$gene
+
+gse.mac <- gseGO(gl_mac, ont = "BP", keyType = "SYMBOL",
+                 OrgDb = "org.Mm.eg.db", eps = 1e-300)
+dotplot(gse.mac, showCategory = 7, split = ".sign") + facet_grid(. ~ .sign)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

@@ -85,12 +85,25 @@ Markers used include `CD3D/E/G`, `CD4`, `IL7R`, `CCR7`, `SELL` (CD4 T);
 ├── README.md                  # this file
 ├── mEV-PBMC.Rmd               # full analysis notebook
 ├── .gitignore
+├── mEV-PBMC-azimuth.Rmd       # Azimuth-mapping companion notebook
 ├── data/                      # NOT tracked — see "Data" below
 │   └── post_aggr/<sample>/outs/count/filtered_feature_bc_matrix/
 ├── ref/                       # NOT tracked — Azimuth / mapping references
 └── results/                   # DE tables and figures
-    └── mono_deg_mEVvssEV.csv
+    ├── mono_deg_mEVvssEV.csv
+    ├── celltype_counts_by_condition.csv
+    ├── de_markers_mvss_cd14.csv / de_markers_mvsp_cd14.csv / de_markers_svsp_cd14.csv
+    └── gse.mvss.cd14.csv / gse.mvsp.cd14.csv / gse.svsp.cd14.csv
 ```
+
+The repo contains two complementary analysis notebooks:
+
+- **`mEV-PBMC.Rmd`** — HTO demultiplexing → CCA integration → marker-based
+  manual annotation → pseudobulk DESeq2 DE (mEV vs sEV).
+- **`mEV-PBMC-azimuth.Rmd`** — Azimuth reference mapping (`pbmcref`,
+  `predicted.celltype.l2`) → CD14-monocyte pairwise DE across all three
+  conditions (mEV/sEV/PBS) → GSEA, with optional CD14 subclustering and
+  Slingshot trajectory analysis.
 
 ## Data
 
@@ -106,7 +119,9 @@ R (≥ 4.2) with:
 - **Seurat** (core analysis), **SeuratData**, **Azimuth**
 - **Matrix**, **dplyr**, **tidyverse**, **ggplot2**, **ggridges**, **patchwork**, **ggrepel**
 - **DESeq2** (via Seurat `FindMarkers`, `test.use = "DESeq2"`)
-- **clusterProfiler**, **org.Hs.eg.db**, **AnnotationDbi** (GO enrichment)
+- **clusterProfiler**, **org.Hs.eg.db**, **org.Mm.eg.db**, **AnnotationDbi**, **DOSE** (GO/GSEA enrichment)
+- **data.table**, **cowplot** (`mEV-PBMC-azimuth.Rmd`)
+- **slingshot**, **SingleCellExperiment** (optional trajectory analysis)
 - **monocle3**
 
 Install Bioconductor packages with `BiocManager::install(...)`.
@@ -114,8 +129,12 @@ Install Bioconductor packages with `BiocManager::install(...)`.
 ## Reproduction
 
 1. Clone the repo and place data under `data/post_aggr/`.
-2. Open `mEV-PBMC.Rmd` in RStudio and set `data_dir`.
-3. Knit, or run chunks sequentially. DE tables are written to `results/`.
+2. Open `mEV-PBMC.Rmd` (or `mEV-PBMC-azimuth.Rmd`) in RStudio and set `data_dir`.
+3. Knit, or run chunks sequentially. Tables are written to `results/`.
+
+In `mEV-PBMC-azimuth.Rmd`, run the `azimuth-run` chunk once (it is
+`eval=FALSE`) to compute and cache `results/merged.mapped.rds`; later knits
+reload the cache via `azimuth-load`.
 
 ## Notes on this version
 
@@ -126,3 +145,17 @@ outside a runnable chunk) was made runnable; hard-coded absolute paths were
 replaced with a relative `data/` convention; and the `enrichGO` call was
 corrected to use `OrgDb = org.Hs.eg.db` with `keyType = "SYMBOL"`. The analysis
 logic, thresholds, and annotations are unchanged.
+
+`mEV-PBMC-azimuth.Rmd` was cleaned up from the original `PBMC_az_map.Rmd` the
+same way: per-sample load/QC/metadata chunks collapsed into loops over `samples`;
+absolute `/Volumes/...`, `~/Documents/...`, and `~/Downloads/...` paths replaced
+with relative `data/` and `results/` conventions; the QC `subset()` calls (which
+in the original ran on the per-sample objects *after* the merge and were never
+propagated) moved to operate on the merged object; the three pairwise CD14 DE
+calls, volcano plots, and GSEA runs refactored into `cd14_de()`, `volcano()`, and
+`run_gse()` helpers; the duplicated `data`/`seu`/`sling` objects standardized to a
+single `cd14` object; the many broken/duplicate Slingshot fragments consolidated
+into one coherent `eval=FALSE` exploratory chunk; manuscript `tiff()`/`png()`
+figure exports removed in favour of inline display; and `RunAzimuth` wrapped in a
+cache-once / reload pattern. Analysis logic, thresholds, and cell-type focus are
+unchanged.
